@@ -42,6 +42,8 @@ volatile float delta_theta_per_call = 0.0f;
 volatile int8_t motor_direction = 0;
 volatile uint8_t MoveCommand =0;
 
+float Ecce_LUT[1024]; // Index to compute LUT for eccentricity calculation
+
 
 // Closed-loop state
 volatile float encoder_offset = 0.0f;
@@ -51,6 +53,7 @@ volatile float speed_rpm = 0.0f;
 volatile float speed_filtered = 0.0f;
 volatile bool closedloop_enable = false;
 volatile float speed_raw_rpm =0;
+volatile float speed_error=0;
 
 // Voltage commands
 volatile float Vd_cmd = 0.0f;
@@ -92,7 +95,7 @@ volatile uint16_t debug_count4 =0;
 volatile uint8_t openloop_enable = 0;
 
 // Debug Controls
-bool debug_enable = false;
+bool debug_enable = true;
 
 
 /* ===================== PI CONTROLLER GLOBALS ===================== */
@@ -103,7 +106,7 @@ float PI_Ki = 0.0f;
 float PI_dt = 0.0f;
 
 // PI Controller state
-float PI_integral = 0.0f;
+volatile float PI_integral = 0.0f;
 
 // PI Controller limits
 float PI_output_min = 0.0f;
@@ -159,7 +162,7 @@ void Update_Control_Timing(float new_isr_freq_hz)
 
 /* ===================== LOW-PASS FILTER ===================== */
 
-/*Uses a 1st order discrete low pass filter
+/*Uses a 1st order discrete low pass filter (IIR Filter)
 * y = alpha * y_prev + (1.0f - alpha) * x     
 * y = present out
 * x=present input
@@ -294,9 +297,9 @@ void Run_Targetangle(float angle)
 }
 /* ===================== CALIBRATION ===================== */
 
-void Run_Calibration(void)
+void Run_Calibration_offset(void)
 {
-    /*Calibration depends on open-loop speed. It is set to 60RPM by default. 
+    /*Calibration depends on open-loop speed. It is set to 60RPM by default.
     * Changing this value will affect the calibration process*/
 	USART_SendString("\r\n CALIBRATING.... \r\n");
     // Lock rotor to electrical angle 0
@@ -348,6 +351,7 @@ void Run_Calibration(void)
 	    percent = percent + (14.28f);
 	}
 
+    encoder_offset = 5.578f;
 	// Ramp down alignment voltage
 	LL_TIM_OC_SetCompareCH1(TIM1, PWM_ARR / 2);
 	LL_TIM_OC_SetCompareCH2(TIM1, PWM_ARR / 2);
@@ -357,85 +361,201 @@ void Run_Calibration(void)
 
 }
 
+/*ECCENTRICITY CALIBRATION */
+
+void Run_Calibration_eccentricity(void)
+{
+    /* Clear LUT to 0 — gap detection uses zero check, same as reference */
+    for (int i = 0; i < 1024; i++) {
+        Ecce_LUT[i] = 0.0f;
+    }
+
+    USART_SendString("\r\n Running Eccentricity Calibration.... \r\n");
+
+    /* Sweep 1024 equally spaced mechanical positions across one full revolution */
+    for (int i = 0; i < 1024; i++)
+    {
+        /* 1. Compute target mechanical angle and convert to electrical */
+        float theta_mech_deg = (float)i * (360.0f / 1024.0f);   /* 0.351 deg per step  */
+        float theta_mech_rad = theta_mech_deg * (TWO_PI / 360.0f);
+        float theta_elec_rad = theta_mech_rad * POLE_PAIRS;
+
+        /* Normalise electrical angle to [0, 2π) */
+        theta_elec_rad -= TWO_PI * floorf(theta_elec_rad / TWO_PI);
+
+        /* 2. Apply voltage vector and wait briefly */
+        Run_Targetangle(theta_elec_rad);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        /* 3. Read actual rotor position from encoder */
+        uint16_t angle_raw      = AS5600_ReadAngle_Blocking();
+        float    angle_mech_rad = AS5600_Angle_To_Radians(angle_raw);
+
+        /* 4. Compute error in ELECTRICAL radians */
+        float e_angle_rad = (angle_mech_rad * POLE_PAIRS) - encoder_offset;
+        float error = theta_elec_rad - e_angle_rad;
+
+        /* 5. Normalise error to (-π, +π) */
+        error -= TWO_PI * floorf((error + (float)M_PI) / TWO_PI);
+
+        /* 6. Index LUT by ACTUAL sensor position 
+         *    Scale: (mech_rad / 2π) × LUT_SIZE  */
+        float lut_pos  = (angle_mech_rad / TWO_PI) * 1024.0f;
+        int   lut_index = (int)lut_pos % 1024;
+        if (lut_index < 0) lut_index += 1024;   /* Guard against negative modulo */
+
+        Ecce_LUT[lut_index] = error;
+
+        if (debug_enable)
+        {
+            char msg[64];
+            snprintf(msg, sizeof(msg),
+                     " lut_index: %d , error: %.4f rad \r\n", lut_index, error);
+            USART_SendString(msg);
+        }
+    }
+
+    /* 7. Fill any empty bins by averaging neighbours.*/
+    Clean_Eccentricity_LUT(Ecce_LUT);
+
+//    Average the boundary points to smooth the 1023→0 transition
+//    float boundary_avg = (Ecce_LUT[0] + Ecce_LUT[1023]) * 0.5f;
+//    Ecce_LUT[0]    = boundary_avg;
+//    Ecce_LUT[1023] = boundary_avg;
+
+    /* 8. Kill voltage output */
+    LL_TIM_OC_SetCompareCH1(TIM1, PWM_ARR / 2);
+    LL_TIM_OC_SetCompareCH2(TIM1, PWM_ARR / 2);
+    LL_TIM_OC_SetCompareCH3(TIM1, PWM_ARR / 2);
+
+    USART_SendString("\r\n Eccentricity Calibration Complete \r\n");
+}
+
+
+/* CLEAN LUT — SIMPLE NEIGHBOUR AVERAGE */
+
+void Clean_Eccentricity_LUT(volatile float* lut)
+{
+    int valid_count = 0;
+    for (int j = 0; j < 1024; j++) if (lut[j] != 0.0f) valid_count++;
+
+    if (valid_count < 2)
+    {
+        USART_SendString("Error: Calibration failed, not enough data!\r\n");
+        return;
+    }
+
+    /* Two passes to handle back-to-back empty bins */
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (int i = 0; i < 1024; i++)
+        {
+            if (lut[i] == 0.0f)
+            {
+                int last_i = (i - 1 + 1024) % 1024;
+                int next_i = (i + 1) % 1024;
+                lut[i] = (lut[last_i] + lut[next_i]) * 0.5f;
+            }
+        }
+    }
+
+
+    USART_SendString("LUT gap filling complete \r\n");
+}
+
+
 /* ===================== CLOSED-LOOP CONTROL ===================== */
 
 void Run_Closed_Loop(void)
 {
-	static volatile uint8_t first_run = 1;
-	static volatile float angle_mech_prev=0;
+    static volatile uint8_t first_run = 1;
+    static volatile float   angle_mech_prev = 0.0f;
 
-	// Read encoder
-	uint16_t angle_raw = AS5600_ReadAngle_Blocking();
-	float angle_mech = AS5600_Angle_To_Radians(angle_raw);
+    /* 1. Read raw encoder */
+    uint16_t angle_raw      = AS5600_ReadAngle_Blocking();
+    float    angle_mech_raw = AS5600_Angle_To_Radians(angle_raw);
 
-	// Calculate delta on MECHANICAL angle 
-	float delta_mech = angle_mech -  angle_mech_prev;
+    /* 2. Look up eccentricity correction from LUT
+     *    Index by actual sensor position — same as calibration build */
+    float lut_pos  = (angle_mech_raw / TWO_PI) * 1024.0f;
+    int   i_low    = (int)lut_pos % 1024;
+    if (i_low < 0) i_low += 1024;
+    int   i_high   = (i_low + 1) % 1024;
+    float fraction = lut_pos - floorf(lut_pos);
 
-	// Skip first iteration
-	if (first_run)
-	{
-		angle_mech_prev = angle_mech;
-		first_run = 0;
-		return;
-	}
+    /* Interpolate correction between neighbouring LUT entries */
+    float diff = Ecce_LUT[i_high] - Ecce_LUT[i_low];
+    /* Unwrap diff across ±π boundary */
+    if (diff >  (float)M_PI) diff -= TWO_PI;
+    if (diff < -(float)M_PI) diff += TWO_PI;
+    float correction = Ecce_LUT[i_low] + (fraction * diff);
 
-	// wrap-around 
-	if (delta_mech > 3.1415926f)       delta_mech -= 6.2831853f;
-	else if (delta_mech < -3.1415926f) delta_mech += 6.2831853f;
+    /* 3. Compute raw electrical angle and apply LUT correction   */
+    float e_angle_raw = (angle_mech_raw * POLE_PAIRS) - encoder_offset;
+    float theta_electrical = e_angle_raw + correction;
 
-	speed_raw_rpm = delta_mech*9549.29f;// Const = 60/dt*2PI  // dt = 0.001s
-	speed_rpm = LPF_Update(speed_raw_rpm, &speed_filtered);
-	angle_mech_prev = angle_mech;
-	theta_electrical = (angle_mech * POLE_PAIRS) - (5.578f);// encoder offset hard coded
+    /* Normalise to [0, 2π) using floor unwrap */
+    theta_electrical -= TWO_PI * floorf(theta_electrical / TWO_PI);
 
-	// Normalize
-	while (theta_electrical >= TWO_PI) theta_electrical -= TWO_PI;
-	while (theta_electrical < 0.0f) theta_electrical += TWO_PI;
+    //float angle_mech_rad = angle_mech_raw + (correction/POLE_PAIRS);
+    float angle_mech_rad = angle_mech_raw;
 
-	// PI Controller
-	float speed_error = speed_ref_rpm - speed_rpm;
-	Vq_cmd = PI_Update(speed_error);
-	// Vq_cmd = 1.0f;
-	Vd_cmd = 0.0f;
+    if (first_run)
+    {
+        angle_mech_prev = angle_mech_rad;
+        first_run = 0;
+        return;
+    }
 
+    /* 4. Speed estimation using mechanical angle */
+    float delta_mech = angle_mech_rad - angle_mech_prev;
 
-	// Rest of FOC...
-	float cos_theta = cos_from_lut(theta_electrical);
-	float sin_theta = sin_from_lut(theta_electrical);
+    /* Unwrap delta */
+    if      (delta_mech >  (float)M_PI) delta_mech -= TWO_PI;
+    else if (delta_mech < -(float)M_PI) delta_mech += TWO_PI;
 
-	float Valpha = -Vq_cmd * sin_theta;  // Since Vd=0
-	float Vbeta  = Vq_cmd * cos_theta;
+    speed_raw_rpm = delta_mech * 9549.29f;
+    speed_rpm     = LPF_Update(speed_raw_rpm, &speed_filtered);
+    angle_mech_prev = angle_mech_rad;
 
-	/* ================= Refer the equations Here ===================
-	 * https://in.mathworks.com/help/mcb/ref/inverseclarketransform.html
-	 * https://in.mathworks.com/help/mcb/ref/inverseparktransform.html
-	 */
+    /* 5. PI speed controller */
+    speed_error = speed_ref_rpm - speed_rpm;
+    Vq_cmd      = PI_Update(speed_error);
+    Vd_cmd      = 0.0f;
 
-	float Va = Valpha;
-	float Vb = -0.5f * Valpha + 0.866f * Vbeta; //(sqrt(3))/2 = 0.866
-	float Vc = -0.5f * Valpha - 0.866f * Vbeta;
+    /* 6. Inverse Park (Vd=0 simplified) */
+    float cos_theta = cos_from_lut(theta_electrical);
+    float sin_theta = sin_from_lut(theta_electrical);
 
-	float Vdc_half = VDC_VOLTAGE / 2.0f;
+    float Valpha = -Vq_cmd * sin_theta;
+    float Vbeta  =  Vq_cmd * cos_theta;
 
-	float duty_a = Va / Vdc_half;
-	float duty_b = Vb / Vdc_half;
-	float duty_c = Vc / Vdc_half;
+    /* 7. Inverse Clarke */
+    float Va =  Valpha;
+    float Vb = -0.5f * Valpha + 0.866025f * Vbeta;
+    float Vc = -0.5f * Valpha - 0.866025f * Vbeta;
 
-	if (duty_a > 1.0f) duty_a = 1.0f;
-	if (duty_a < -1.0f) duty_a = -1.0f;
-	if (duty_b > 1.0f) duty_b = 1.0f;
-	if (duty_b < -1.0f) duty_b = -1.0f;
-	if (duty_c > 1.0f) duty_c = 1.0f;
-	if (duty_c < -1.0f) duty_c = -1.0f;
+    /* 8. Normalise to duty cycle and write CCR */
+    float Vdc_half = VDC_VOLTAGE * 0.5f;
 
-	pwm_a = (uint16_t)((duty_a + 1.0f) * 0.5f * PWM_ARR);
-	pwm_b = (uint16_t)((duty_b + 1.0f) * 0.5f * PWM_ARR);
-	pwm_c = (uint16_t)((duty_c + 1.0f) * 0.5f * PWM_ARR);
+    float duty_a = Va / Vdc_half;
+    float duty_b = Vb / Vdc_half;
+    float duty_c = Vc / Vdc_half;
 
-	LL_TIM_OC_SetCompareCH1(TIM1, pwm_a);
-	LL_TIM_OC_SetCompareCH2(TIM1, pwm_b);
-	LL_TIM_OC_SetCompareCH3(TIM1, pwm_c);
+    if (duty_a >  1.0f) duty_a =  1.0f;
+    if (duty_a < -1.0f) duty_a = -1.0f;
+    if (duty_b >  1.0f) duty_b =  1.0f;
+    if (duty_b < -1.0f) duty_b = -1.0f;
+    if (duty_c >  1.0f) duty_c =  1.0f;
+    if (duty_c < -1.0f) duty_c = -1.0f;
 
+    pwm_a = (uint16_t)((duty_a + 1.0f) * 0.5f * PWM_ARR);
+    pwm_b = (uint16_t)((duty_b + 1.0f) * 0.5f * PWM_ARR);
+    pwm_c = (uint16_t)((duty_c + 1.0f) * 0.5f * PWM_ARR);
+
+    LL_TIM_OC_SetCompareCH1(TIM1, pwm_a);
+    LL_TIM_OC_SetCompareCH2(TIM1, pwm_b);
+    LL_TIM_OC_SetCompareCH3(TIM1, pwm_c);
 }
 
 
@@ -446,6 +566,10 @@ float AS5600_Angle_To_Radians(uint16_t angle_12bit)
     return (float)angle_12bit * TWO_PI / 4096.0f;
 }
 
+float AS5600_Radians_To_Angle(float angle_rad)
+{
+	return(float)angle_rad*360/TWO_PI;
+}
 
 uint16_t AS5600_ReadAngle_Blocking(void)
 {
@@ -568,47 +692,47 @@ void PI_Reset(void)
 
 float PI_Update(float error)
 {
-    // Proportional term
-    float P_term = PI_Kp * error;
-
-    // Integral term with anti-windup
-    PI_integral += error * PI_dt;
-
-    // Clamp integral to prevent windup
-    if (PI_integral > PI_integral_max)
-        PI_integral = PI_integral_max;
-    if (PI_integral < PI_integral_min)
-        PI_integral = PI_integral_min;
-
-    float I_term = PI_Ki * PI_integral;
-
-    // Calculate output
-    float output = P_term + I_term;
-
-    // Saturate output
-    if (output > PI_output_max)
-        output = PI_output_max;
-    if (output < PI_output_min)
-        output = PI_output_min;
-
-//	// Proportional Term
-//	float P_term = PI_Kp * error;
+//    // Proportional term
+//    float P_term = PI_Kp * error;
 //
-//	// Integral Term - we multiply by Ki *before* adding to the integrator
-//	// This makes the 'integrator' variable actually represent Volts (or Current)
-//	PI_integral += (PI_Ki * error * PI_dt);
+//    // Integral term with anti-windup
+//    PI_integral += error * PI_dt;
 //
-//	// Clamping the Integrator (Anti-Windup)
-//	// Limits should match your VDC/2 (e.g., -12V to 12V)
-//	if (PI_integral > PI_output_max) PI_integral = PI_output_max;
-//	else if (PI_integral < PI_output_min) PI_integral = PI_output_min;
+//    // Clamp integral to prevent windup
+//    if (PI_integral > PI_integral_max)
+//        PI_integral = PI_integral_max;
+//    if (PI_integral < PI_integral_min)
+//        PI_integral = PI_integral_min;
 //
-//	// Sum
-//	float output = P_term + PI_integral;
+//    float I_term = PI_Ki * PI_integral;
 //
-//	// Final Output Saturation
-//	if (output > PI_output_max) output = PI_output_max;
-//	else if (output < PI_output_min) output = PI_output_min;
+//    // Calculate output
+//    float output = P_term + I_term;
+//
+//    // Saturate output
+//    if (output > PI_output_max)
+//        output = PI_output_max;
+//    if (output < PI_output_min)
+//        output = PI_output_min;
+
+	// Proportional Term
+	float P_term = PI_Kp * error;
+
+	// Integral Term - we multiply by Ki *before* adding to the integrator
+	// This makes the 'integrator' variable actually represent Volts (or Current)
+	PI_integral += (PI_Ki * error * PI_dt);
+
+	// Clamping the Integrator (Anti-Windup)
+	// Limits should match your VDC/2 (e.g., -6V to 6V)
+	if (PI_integral > PI_output_max) PI_integral = PI_output_max;
+	else if (PI_integral < PI_output_min) PI_integral = PI_output_min;
+
+	// Sum
+	float output = P_term + PI_integral;
+
+	// Final Output Saturation
+	if (output > PI_output_max) output = PI_output_max;
+	else if (output < PI_output_min) output = PI_output_min;
 
     return output;
 }

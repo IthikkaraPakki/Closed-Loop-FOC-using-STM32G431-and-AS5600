@@ -8,9 +8,17 @@ The project uses a
 The software work with any of STM32 which can run at 168MHz or 170MHz. 16MHz won't be enough meet timing deadlines. 
 
 Closed Loop FOC works by maintaining the stator magnetic field 90 apart from rotor magnetic field and controlling the voltage based on motor load to keep up the speed, just like a brushed DC motor except everything is controlled electronically. This will generate maximum torque possible at any given voltage and more efficiency unlike tradition variable frequency drives whose load angle varies and at different motor loads and is difficult to control. FOC can also give you very fine control if tuned properly.
-
+\
+\
+Features:
+1. Auto Calibration - offset<sup>1</sup> + eccentricity
+2. Openloop Control
+3. Closedloop Control - Speed Control
+4. Encoder failure safe mode.
 
 ## Velocity Control ##
+This project implements Speed Control mode using FOC
+
 ![Velocity loop - Credits: SimpleFOC](Velocity_Loop.png)
 *Velocity loop - Image Credits: SimpleFOC*
 \
@@ -21,12 +29,11 @@ Feedforward is not implemented in the software.
 
 
 ## Torque Control ##
+Torque or current is not regulated actively in this setup, instead speed control loops commands a voltage which is translated to current based on motor speed and impedance of motor. To keep things simple, it is a voltage control method. **So the user should use a current limited power source or implement current control and overcurrent protection.**
+
 ![Velocity loop - Image Credits: SimpleFOC](Torque_Loop.png)
 \
 *Torque loop - Image Credits: SimpleFOC* 
-
-Torque loop won't measure or control any currents. To keep things simple, it is a voltage control method. You have to either implement current control or limit the current from the source.
-
 
 ## Setting Up ##
 Make sure to add the third party folder to path in project settings in CubeIDE. Or else you can place all the .h files in inc and .c in src folders respectively, but not advised for clean freaks. 
@@ -39,8 +46,8 @@ Make sure to add the third party folder to path in project settings in CubeIDE. 
 6. Configure the corresponding USART for you particular board. Make sure to add USART interrupt code inside STM32g4xx_it.c to your USARTx ISR.
 7. Refer .ioc for any configuration settings references or you can check USART2_Init, not USART_init.
 8. Make sure to disable "Generate IRQ Handler" for pendsv, Systick timer and System Service Call under SystemCore >> NVIC >> CodeGenration. These are already defined in FreeRTOS files.
-9. As of now, calibrated encoder offset value is hardcoded. You can set debug_enable as true, then take the printed offset angles and calculate the average, then replace the hardcoded value with your value.
-8. Also change the delay value in calibration inside closedloop.c >> Run_Calibration(). Now you're good to go!
+9. As of now, calibrated encoder offset value is hardcoded. You can set debug_enable as true, then take the printed offset angles and calculate the average, then replace the hardcoded value with your value.<sup>2</sup>
+8. Also change the delay value in calibration inside closedloop.c >> Run_Calibration_offset() based on your pole pair. Now you're good to go!
 
 ```
 	    MoveCommand = 1; // enable openloop inside ISR
@@ -50,7 +57,7 @@ Make sure to add the third party folder to path in project settings in CubeIDE. 
 	    MoveCommand = 0;
 ```
 
-**While calibrating look out for offset angle crossing 0rad multiple times. For example, if your motor has 5 polepair, then there will be 5 calibration point and 4 points gave you value to 4 to 6rad, but 1 point went beyond 6.28rad(2PI) and gave 0.3rad. This can mess up your simple arithmetic average value (Arithmetic Averages Fail on Circles). So while taking average use a Sine/Cosine Averaging (Circular Mean) and then use atan2**
+<sup>*1</sup> <sup>*2</sup> ***Note: While calibrating look out for offset angle crossing 0rad multiple times. For example, if your motor has 5 polepair, then there will be 5 calibration points and 4 points gave you values from 4 to 6rad, but 1 point went beyond 6.28rad(2PI) and gave 0.3rad. This can mess up your simple arithmetic average value (Arithmetic Averages Fail on Circles). So while taking average use a Sine/Cosine Averaging (Circular Mean) and then use atan2***
 
 ## Architecture Brief ##
 The project uses FreeRTOS to switch between states and uses interrupt service routines ISRs to execute time sensitive motor control logic. 
@@ -69,5 +76,3 @@ I2c is implemented as a blocking code. Any delay in transaction greater than tim
 **Note: This software is intended for educational purposes. This is not production ready code. Practice caution while using the code.**
 \
 **Note: Use a current limited power source since there is no current control or over current protection implemented.**
-\
-**Note: 

@@ -62,6 +62,7 @@ extern volatile float dt_seconds;
 // Control inputs
 extern volatile float speed_ref_rpm;
 extern volatile float amplitude;
+extern volatile float PI_integral;
 
 // Open-loop state & direction sense
 extern volatile float theta;
@@ -71,6 +72,7 @@ extern volatile float delta_theta_per_call;
 //Calibration
 extern volatile int8_t motor_direction;
 extern volatile uint8_t MoveCommand;
+extern float Ecce_LUT[1024];
 
 // Closed-loop state
 extern volatile float encoder_offset;
@@ -79,6 +81,7 @@ extern volatile float theta_electrical_prev;
 extern volatile float speed_rpm;
 extern volatile float speed_filtered;
 extern volatile bool closedloop_enable;
+extern volatile float speed_error;
 
 // Voltage commands
 extern volatile float Vd_cmd;
@@ -119,10 +122,12 @@ void init_sine_lut(void);
 void Update_Control_Timing(float new_isr_freq_hz);
 void LPF_Init(float cutoff_freq_hz, float sample_freq_hz);
 
-// Main control functions
+// Main control & calibration functions
 void Motor_Control_ISR(void);
 void Run_Open_Loop(void);
-void Run_Calibration(void);
+void Run_Calibration_offset(void);
+void Run_Calibration_eccentricity(void);
+void Clean_Eccentricity_LUT(volatile float *lut);
 void Run_Closed_Loop(void);
 void Run_Targetangle(float angle);
 
@@ -139,6 +144,7 @@ void USART_ProcessCommand(void);
 // I2C functions
 uint16_t AS5600_ReadAngle_Blocking(void);
 float AS5600_Angle_To_Radians(uint16_t);
+float AS5600_Radians_To_Angle(float);
 
 // FreeRTOS task
 void Task_State_Machine(void *pvParameters);

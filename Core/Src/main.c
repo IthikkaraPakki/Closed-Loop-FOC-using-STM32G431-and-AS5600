@@ -547,7 +547,7 @@ static void stateMachineUpdate_handler(void *parameters)
 {
 
 	// Initialize PI controller
-	PI_Init(0.04f, 0.09f, dt_seconds, -VDC_VOLTAGE/2, VDC_VOLTAGE/2);
+	PI_Init(0.05f, 1.5f, dt_seconds, -VDC_VOLTAGE/2, VDC_VOLTAGE/2);
 	vTaskDelay(pdMS_TO_TICKS(2000));
 	USART_SendString("\r\n=== Motor Control Started ===\r\n");
 	system_state = STATE_CALIBRATION;
@@ -558,7 +558,8 @@ static void stateMachineUpdate_handler(void *parameters)
 		switch (system_state)
 		{
 		case STATE_CALIBRATION:
-			Run_Calibration();
+			Run_Calibration_offset();
+			Run_Calibration_eccentricity();
 
 			//When calibration complete, transition to closed-loop
 			USART_SendString("\r\nTransitioning to OpenLoop\r\n");
@@ -588,13 +589,13 @@ static void stateMachineUpdate_handler(void *parameters)
 
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			USART_SendString("\r\nSystem State: CLOSED_LOOP\r\n"); // Printing every 1s
-			char dbg[64];
-			snprintf(dbg, sizeof(dbg),"Ref_rpm:%.2f  RPM:%.1f  Vq:%.2f  dt:%.5f \r\n",speed_ref_rpm, speed_rpm, Vq_cmd, dt_seconds);
+			char dbg[128];
+			snprintf(dbg, sizeof(dbg),"Ref_rpm:%.2f  RPM:%.1f  Vq:%.2f  speed_error:%.2f PI_integral: %0.2f \r\n",speed_ref_rpm, speed_rpm, Vq_cmd, speed_error, PI_integral);
 			USART_SendString(dbg);
       break;
 
 		case STATE_FAULT:
-      // Print error details
+            // Print error details
 			char fault_msg[128];
 			const char *error_names[] = {"None", "TXIS", "TC", "RX_High", "RX_Low", "STOP"};
 
@@ -603,8 +604,8 @@ static void stateMachineUpdate_handler(void *parameters)
 					 error_names[i2c_last_error], i2c_error_count);
 			USART_SendString(fault_msg);
 
-      // Stay in fault state - manual reset required
-      vTaskDelay(pdMS_TO_TICKS(2000));  // Print every 2 seconds
+			// Stay in fault state - manual reset required
+			vTaskDelay(pdMS_TO_TICKS(2000));  // Print every 2 seconds
       break;
 		}
 	}
